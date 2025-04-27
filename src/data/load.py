@@ -1,10 +1,11 @@
-import torch
-import torchvision
-from torch.utils.data import TensorDataset
-# Testing
+from sklearn.datasets import load_wine  # <-- Cambio aquí
+from sklearn.model_selection import train_test_split 
+import pandas as pd 
 import argparse
-import wandb
-
+import wandb 
+import numpy as np
+#
+# 🎯 Argument parser for execution ID.
 parser = argparse.ArgumentParser()
 parser.add_argument('--IdExecution', type=str, help='ID of the execution')
 args = parser.parse_args()
@@ -12,51 +13,71 @@ args = parser.parse_args()
 if args.IdExecution:
     print(f"IdExecution: {args.IdExecution}")
 
-def load(train_size=.8):
+def load(train_size=0.8, val_size=0.1, random_state=42):
     """
-    # Load the data
+    Loads and splits the Wine dataset into train, validation, and test sets.
     """
-      
-    # the data, split between train and test sets
-    train = torchvision.datasets.MNIST(root='./data', train=True, download=True)
-    test = torchvision.datasets.MNIST(root='./data', train=False, download=True)
+    wine = load_wine()  # <-- Cambio aquí
+    X = wine.data
+    y = wine.target
 
-    (x_train, y_train), (x_test, y_test) = (train.data, train.targets), (test.data, test.targets)
+    # Split into training and temp (val + test)
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X, y, train_size=train_size, stratify=y, random_state=random_state
+    )
 
-    # split off a validation set for hyperparameter tuning
-    x_train, x_val = x_train[:int(len(train)*train_size)], x_train[int(len(train)*train_size):]
-    y_train, y_val = y_train[:int(len(train)*train_size)], y_train[int(len(train)*train_size):]
+    # Split temp into validation and test
+    val_ratio = val_size / (1 - train_size)
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=1 - val_ratio, stratify=y_temp, random_state=random_state
+    )
 
-    training_set = TensorDataset(x_train, y_train)
-    validation_set = TensorDataset(x_val, y_val)
-    test_set = TensorDataset(x_test, y_test)
-    datasets = [training_set, validation_set, test_set]
-    return datasets
+    return (X_train, y_train), (X_val, y_val), (X_test, y_test)
 
 def load_and_log():
-    # 🚀 start a run, with a type to label it and a project it can call home
+    """
+    Loads the data, formats it as DataFrames, and logs it to Weights & Biases (W&B)
+    as a versioned artifact.
+    """
     with wandb.init(
         project="MLOps-Pycon2023",
-        name=f"Load Raw Data ExecId-{args.IdExecution}", job_type="load-data") as run:
-        
-        datasets = load()  # separate code for loading the datasets
+        name=f"Load Raw Data ExecId-{args.IdExecution}",
+        job_type="load-data"
+    ) as run:
+
+        # Load dataset splits
+        (X_train, y_train), (X_val, y_val), (X_test, y_test) = load()
+
+        # Convert to DataFrames
+        feature_names = [f"feature_{i}" for i in range(X_train.shape[1])]
+        train_df = pd.DataFrame(X_train, columns=feature_names)
+        train_df["target"] = y_train
+
+        val_df = pd.DataFrame(X_val, columns=feature_names)
+        val_df["target"] = y_val
+
+        test_df = pd.DataFrame(X_test, columns=feature_names)
+        test_df["target"] = y_test
+
+        datasets = [train_df, val_df, test_df]
         names = ["training", "validation", "test"]
 
-        # 🏺 create our Artifact
+        # Create and populate the artifact
         raw_data = wandb.Artifact(
-            "mnist-raw", type="dataset",
-            description="raw MNIST dataset, split into train/val/test",
-            metadata={"source": "torchvision.datasets.MNIST",
-                      "sizes": [len(dataset) for dataset in datasets]})
+            name="wine-raw",  # <-- Cambio aquí
+            type="dataset",
+            description="Wine dataset split into train/val/test",  # <-- Cambio aquí
+            metadata={
+                "source": "sklearn.datasets.load_wine",  # <-- Cambio aquí
+                "sizes": [len(df) for df in datasets]
+            }
+        )
 
-        for name, data in zip(names, datasets):
-            # 🐣 Store a new file in the artifact, and write something into its contents.
-            with raw_data.new_file(name + ".pt", mode="wb") as file:
-                x, y = data.tensors
-                torch.save((x, y), file)
+        for name, df in zip(names, datasets):
+            with raw_data.new_file(f"{name}.csv", mode="w") as f:
+                df.to_csv(f, index=False)
 
-        # ✍️ Save the artifact to W&B.
         run.log_artifact(raw_data)
 
-# testing
+# Run the function.
 load_and_log()
