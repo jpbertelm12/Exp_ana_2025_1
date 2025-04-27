@@ -1,15 +1,12 @@
-import torch
-import torch.nn.functional as F
-from torch import nn 
-from torch.utils.data import TensorDataset
-
-# Import the model class from the main file
-from src.Classifier import Classifier
-
+import pandas as pd
 import os
 import argparse
 import wandb
-
+from sklearn.ensemble import RandomForestClassifier  # <-- Cambio aquí
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, confusion_matrix, classification_report
+from sklearn.model_selection import train_test_split
+#
+# Argument parsing
 parser = argparse.ArgumentParser()
 parser.add_argument('--IdExecution', type=str, help='ID of the execution')
 args = parser.parse_args()
@@ -19,217 +16,96 @@ if args.IdExecution:
 else:
     args.IdExecution = "testing console"
 
-# Device configuration
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-print("Device: ", device)
+# Read CSV data
+def read_csv_data(data_dir, split):
+    filepath = os.path.join(data_dir, f"{split}.csv")
+    df = pd.read_csv(filepath)
 
+    X = df.drop(columns=["target"]).values
+    y = df["target"].values
 
-def read(data_dir, split):
-    """
-    Read data from a directory and return a TensorDataset object.
+    return X, y
 
-    Args:
-    - data_dir (str): The directory where the data is stored.
-    - split (str): The name of the split to read (e.g. "train", "valid", "test").
-
-    Returns:
-    - dataset (TensorDataset): A TensorDataset object containing the data.
-    """
-    filename = split + ".pt"
-    x, y = torch.load(os.path.join(data_dir, filename))
-
-    return TensorDataset(x, y)
-
-
-
-def train(model, train_loader, valid_loader, config):
-    optimizer = getattr(torch.optim, config.optimizer)(model.parameters())
-    model.train()
-    example_ct = 0
-    for epoch in range(config.epochs):
-        for batch_idx, (data, target) in enumerate(train_loader):
-            data, target = data.to(device), target.to(device)
-            data = data.view(data.shape[0],-1)
-            optimizer.zero_grad()
-            output = model(data)
-            loss = F.cross_entropy(output, target)
-            loss.backward()
-            optimizer.step()
-
-            example_ct += len(data)
-
-            if batch_idx % config.batch_log_interval == 0:
-                print('Train Epoch: {} [{}/{} ({:.0%})]\tLoss: {:.6f}'.format(
-                    epoch, batch_idx * len(data), len(train_loader.dataset),
-                    batch_idx / len(train_loader), loss.item()))
-                
-                train_log(loss, example_ct, epoch)
-
-        # evaluate the model on the validation set at each epoch
-        loss, accuracy = test(model, valid_loader)  
-        test_log(loss, accuracy, example_ct, epoch)
-
-    
-def test(model, test_loader):
-    model.eval()
-    test_loss = 0
-    correct = 0
-    with torch.no_grad():
-        for data, target in test_loader:
-            data, target = data.to(device), target.to(device)
-            data = data.view(data.shape[0],-1)
-            output = model(data)
-            test_loss += F.cross_entropy(output, target, reduction='sum')  # sum up batch loss
-            pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
-            correct += pred.eq(target.view_as(pred)).sum()
-
-    test_loss /= len(test_loader.dataset)
-
-    accuracy = 100. * correct / len(test_loader.dataset)
-    
-    return test_loss, accuracy
-
-
-def train_log(loss, example_ct, epoch):
-    loss = float(loss)
-    # where the magic happens
-    wandb.log({"epoch": epoch, "train/loss": loss}, step=example_ct)
-    print(f"Loss after " + str(example_ct).zfill(5) + f" examples: {loss:.3f}")
-    
-
-def test_log(loss, accuracy, example_ct, epoch):
-    loss = float(loss)
-    accuracy = float(accuracy)
-    # where the magic happens
-    wandb.log({"epoch": epoch, "validation/loss": loss, "validation/accuracy": accuracy}, step=example_ct)
-    print(f"Loss/accuracy after " + str(example_ct).zfill(5) + f" examples: {loss:.3f}/{accuracy:.3f}")
-
-def evaluate(model, test_loader):
-    """
-    ## Evaluate the trained model
-    """
-
-    loss, accuracy = test(model, test_loader)
-    highest_losses, hardest_examples, true_labels, predictions = get_hardest_k_examples(model, test_loader.dataset)
-
-    return loss, accuracy, highest_losses, hardest_examples, true_labels, predictions
-
-def get_hardest_k_examples(model, testing_set, k=32):
-    model.eval()
-
-    loader = DataLoader(testing_set, 1, shuffle=False)
-
-    # get the losses and predictions for each item in the dataset
-    losses = None
-    predictions = None
-    with torch.no_grad():
-        for data, target in loader:
-            data, target = data.to(device), target.to(device)
-            data = data.view(data.shape[0],-1)
-            output = model(data)
-            loss = F.cross_entropy(output, target)
-            pred = output.argmax(dim=1, keepdim=True)
-            
-            if losses is None:
-                losses = loss.view((1, 1))
-                predictions = pred
-            else:
-                losses = torch.cat((losses, loss.view((1, 1))), 0)
-                predictions = torch.cat((predictions, pred), 0)
-
-    argsort_loss = torch.argsort(losses, dim=0).cpu()
-
-    highest_k_losses = losses[argsort_loss[-k:]]
-    hardest_k_examples = testing_set[argsort_loss[-k:]][0]
-    true_labels = testing_set[argsort_loss[-k:]][1]
-    predicted_labels = predictions[argsort_loss[-k:]]
-
-    return highest_k_losses, hardest_k_examples, true_labels, predicted_labels
-
-from torch.utils.data import DataLoader
-
-def train_and_log(config,experiment_id='99'):
-    with wandb.init(
-        project="MLOps-Pycon2023", 
-        name=f"Train Model ExecId-{args.IdExecution} ExperimentId-{experiment_id}", 
-        job_type="train-model", config=config) as run:
-        config = wandb.config
-        data = run.use_artifact('mnist-preprocess:latest')
-        data_dir = data.download()
-
-        training_dataset =  read(data_dir, "training")
-        validation_dataset = read(data_dir, "validation")
-
-        train_loader = DataLoader(training_dataset, batch_size=config.batch_size)
-        validation_loader = DataLoader(validation_dataset, batch_size=config.batch_size)
-        
-        model_artifact = run.use_artifact("linear:latest")
-        model_dir = model_artifact.download()
-        model_path = os.path.join(model_dir, "initialized_model_linear.pth")
-        model_config = model_artifact.metadata
-        config.update(model_config)
-
-        model = Classifier(**model_config)
-        model.load_state_dict(torch.load(model_path))
-        model = model.to(device)
- 
-        train(model, train_loader, validation_loader, config)
-
-        model_artifact = wandb.Artifact(
-            "trained-model", type="model",
-            description="Trained NN model",
-            metadata=dict(model_config))
-
-        torch.save(model.state_dict(), "trained_model.pth")
-        model_artifact.add_file("trained_model.pth")
-        wandb.save("trained_model.pth")
-
-        run.log_artifact(model_artifact)
-
+# Train model
+def train_model(X_train, y_train, config):
+    model = RandomForestClassifier(
+        n_estimators=config["n_estimators"],
+        max_depth=config["max_depth"],
+        random_state=42
+    )
+    model.fit(X_train, y_train)
     return model
 
-    
-def evaluate_and_log(experiment_id='99',config=None,):
-    
-    with wandb.init(project="MLOps-Pycon2023", name=f"Eval Model ExecId-{args.IdExecution} ExperimentId-{experiment_id}", job_type="eval-model", config=config) as run:
-        data = run.use_artifact('mnist-preprocess:latest')
-        data_dir = data.download()
-        testing_set = read(data_dir, "test")
+# Evaluate model
+def evaluate_model(model, X_test, y_test):
+    y_pred = model.predict(X_test)
+    acc = accuracy_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred, average="weighted")
+    precision = precision_score(y_test, y_pred, average="weighted")
+    recall = recall_score(y_test, y_pred, average="weighted")
+    cm = confusion_matrix(y_test, y_pred)
+    report = classification_report(y_test, y_pred, output_dict=True)
 
-        test_loader = torch.utils.data.DataLoader(testing_set, batch_size=128, shuffle=False)
+    return acc, f1, precision, recall, cm, report
 
-        model_artifact = run.use_artifact("trained-model:latest")
-        model_dir = model_artifact.download()
-        model_path = os.path.join(model_dir, "trained_model.pth")
-        model_config = model_artifact.metadata
+# Main training and evaluation function
+def train_and_evaluate(config, experiment_id='99'):
+    with wandb.init(
+        project="MLOps-Pycon2023",
+        name=f"Train-Eval RandomForest ExecId-{args.IdExecution} ExperimentId-{experiment_id}",
+        job_type="train-eval", config=config
+    ) as run:
 
-        model = Classifier(**model_config)
-        model.load_state_dict(torch.load(model_path))
-        model.to(device)
+        data_artifact = run.use_artifact('wine-preprocessed:latest')  # <-- Cambio aquí
+        data_dir = data_artifact.download()
 
-        loss, accuracy, highest_losses, hardest_examples, true_labels, preds = evaluate(model, test_loader)
+        X_train, y_train = read_csv_data(data_dir, "training")
+        X_val, y_val = read_csv_data(data_dir, "validation")
+        X_test, y_test = read_csv_data(data_dir, "test")
 
-        run.summary.update({"loss": loss, "accuracy": accuracy})
+        # Train
+        model = train_model(X_train, y_train, config)
 
-        wandb.log({"high-loss-examples":
-            [wandb.Image(hard_example, caption=str(int(pred)) + "," +  str(int(label)))
-             for hard_example, pred, label in zip(hardest_examples, preds, true_labels)]})
+        # Evaluate on validation
+        val_acc, val_f1, val_precision, val_recall, _, _ = evaluate_model(model, X_val, y_val)
+        print(f"Validation Accuracy: {val_acc:.4f} | F1: {val_f1:.4f}")
 
-epochs = [50,100,200]
-for id,epoch in enumerate(epochs):
-    train_config = {"batch_size": 128,
-                "epochs": epoch,
-                "batch_log_interval": 25,
-                "optimizer": "Adam"}
-    model = train_and_log(train_config,id)
-    evaluate_and_log(id)        
+        # Evaluate on test
+        test_acc, test_f1, test_precision, test_recall, confusion_mtx, full_report = evaluate_model(model, X_test, y_test)
+        print(f"Test Accuracy: {test_acc:.4f} | F1: {test_f1:.4f}")
 
-"""    
-train_config = {"batch_size": 128,
-                "epochs": 5,
-                "batch_log_interval": 25,
-                "optimizer": "Adam"}
+        # Log metrics
+        wandb.log({
+            "validation/accuracy": val_acc,
+            "validation/f1": val_f1,
+            "validation/precision": val_precision,
+            "validation/recall": val_recall,
+            "test/accuracy": test_acc,
+            "test/f1": test_f1,
+            "test/precision": test_precision,
+            "test/recall": test_recall,
+            "confusion_matrix": wandb.plot.confusion_matrix(
+                preds=model.predict(X_test),
+                y_true=y_test,
+                class_names=[str(i) for i in sorted(set(y_test))]
+            )
+        })
 
-model = train_and_log(train_config)
-evaluate_and_log()
-"""
+# Main execution
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--IdExecution', type=str, help='ID of the execution')
+    args = parser.parse_args()
+
+    if not args.IdExecution:
+        args.IdExecution = "testing-console"
+
+    # You can tune these parameters
+    experiments = [
+        {"n_estimators": 100, "max_depth": None},
+        {"n_estimators": 200, "max_depth": 10},
+        {"n_estimators": 300, "max_depth": 20}
+    ]
+
+    for id, config in enumerate(experiments):
+        train_and_evaluate(config, experiment_id=id)
