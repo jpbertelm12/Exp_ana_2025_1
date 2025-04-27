@@ -1,12 +1,10 @@
-import torch
-import torchvision
-from torch.utils.data import TensorDataset
-
-#testing
+import pandas as pd 
 import os
 import argparse
 import wandb
-
+from sklearn.preprocessing import StandardScaler
+#
+# Argument parsing
 parser = argparse.ArgumentParser()
 parser.add_argument('--IdExecution', type=str, help='ID of the execution')
 args = parser.parse_args()
@@ -14,55 +12,59 @@ args = parser.parse_args()
 if args.IdExecution:
     print(f"IdExecution: {args.IdExecution}")
 else:
-    args.IdExecution = "testing console"
+    args.IdExecution = "testing-console"
 
-def preprocess(dataset, normalize=True, expand_dims=True):
-    """
-    ## Prepare the data
-    """
-    x, y = dataset.tensors
-
+# Preprocess function (normalize features)
+def preprocess(X, y, normalize=True):
     if normalize:
-        # Scale images to the [0, 1] range
-        x = x.type(torch.float32) / 255
+        scaler = StandardScaler()
+        X = scaler.fit_transform(X)
+    return X, y
 
-    if expand_dims:
-        # Make sure images have shape (1, 28, 28)
-        x = torch.unsqueeze(x, 1)
-    
-    return TensorDataset(x, y)
+# Read CSV and return features/target
+def read(data_dir, split):
+    filename = split + ".csv"
+    df = pd.read_csv(os.path.join(data_dir, filename))
 
+    X = df.drop(columns=["target"]).values
+    y = df["target"].values
+
+    return X, y
+
+# Main pipeline: read, preprocess, and log back
 def preprocess_and_log(steps):
 
-    with wandb.init(project="MLOps-Pycon2023",name=f"Preprocess Data ExecId-{args.IdExecution}", job_type="preprocess-data") as run:    
+    with wandb.init(
+        project="MLOps-Pycon2023",
+        name=f"Preprocess Data ExecId-{args.IdExecution}",
+        job_type="preprocess-data"
+    ) as run:    
+
         processed_data = wandb.Artifact(
-            "mnist-preprocess", type="dataset",
-            description="Preprocessed MNIST dataset",
-            metadata=steps)
+            "wine-preprocessed",  # <-- Cambio aquí
+            type="dataset",
+            description="Preprocessed WINE dataset (normalized)",  # <-- Cambio aquí
+            metadata=steps
+        )
          
-        # ✔️ declare which artifact we'll be using
-        raw_data_artifact = run.use_artifact('mnist-raw:latest')
-
-        # 📥 if need be, download the artifact
+        # 🧊 Load raw artifact
+        raw_data_artifact = run.use_artifact('wine-raw:latest')  # <-- Cambio aquí
         raw_dataset = raw_data_artifact.download(root="./data/artifacts/")
-        
+
         for split in ["training", "validation", "test"]:
-            raw_split = read(raw_dataset, split)
-            processed_dataset = preprocess(raw_split, **steps)
+            X, y = read(raw_dataset, split)
+            X_processed, y_processed = preprocess(X, y, **steps)
 
-            with processed_data.new_file(split + ".pt", mode="wb") as file:
-                x, y = processed_dataset.tensors
-                torch.save((x, y), file)
+            # Rebuild DataFrame and save as CSV
+            df = pd.DataFrame(X_processed, columns=[f"feature_{i}" for i in range(X_processed.shape[1])])
+            df["target"] = y_processed
 
+            with processed_data.new_file(f"{split}.csv", mode="w") as file:
+                df.to_csv(file, index=False)
+
+        # Upload the new artifact
         run.log_artifact(processed_data)
 
-def read(data_dir, split):
-    filename = split + ".pt"
-    x, y = torch.load(os.path.join(data_dir, filename))
-
-    return TensorDataset(x, y)
-
-steps = {"normalize": True,
-         "expand_dims": False}
-
+# Trigger the pipeline
+steps = {"normalize": True}
 preprocess_and_log(steps)
